@@ -15,7 +15,6 @@ from trading_skills.news import get_news
 from trading_skills.options import get_expiries, get_option_chain
 from trading_skills.piotroski import calculate_piotroski_score
 from trading_skills.quote import get_quote
-from trading_skills.report import generate_report_data
 from trading_skills.risk import calculate_risk_metrics
 from trading_skills.spreads import (
     analyze_diagonal,
@@ -286,6 +285,7 @@ def scan_pmcc(symbol: str) -> dict:
 def report_stock(symbol: str) -> dict:
     """Generate comprehensive stock analysis report with conviction score, trend, fundamentals, spreads."""
     try:
+        from trading_skills.report import generate_report_data
         return generate_report_data(symbol)
     except Exception as e:
         return {"error": str(e), "symbol": symbol.upper()}
