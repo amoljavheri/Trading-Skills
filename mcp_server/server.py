@@ -17,8 +17,6 @@ from trading_skills.piotroski import calculate_piotroski_score
 from trading_skills.quote import get_quote
 from trading_skills.report import generate_report_data
 from trading_skills.risk import calculate_risk_metrics
-from trading_skills.scanner_bullish import compute_bullish_score, scan_symbols
-from trading_skills.scanner_pmcc import analyze_pmcc, format_scan_results
 from trading_skills.spreads import (
     analyze_diagonal,
     analyze_iron_condor,
@@ -26,7 +24,6 @@ from trading_skills.spreads import (
     analyze_strangle,
     analyze_vertical,
 )
-from trading_skills.technicals import compute_indicators
 
 mcp = FastMCP("trading-skills", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
@@ -94,6 +91,7 @@ def earnings_calendar(symbol: str) -> dict:
 def technical_indicators(symbol: str, period: str = "3mo", indicators: str = "") -> dict:
     """Compute technical indicators. indicators: comma-separated list of rsi,macd,bb,sma,ema,atr,adx,vwap,sr."""
     try:
+        from trading_skills.technicals import compute_indicators
         indicators_list = (
             [i.strip() for i in indicators.split(",") if i.strip()] if indicators else None
         )
@@ -253,6 +251,7 @@ def spread_iron_condor(
 def scan_bullish(symbol: str, period: str = "12mo") -> dict:
     """Score a symbol for bullish trend (0-11.5 scale). Pass comma-separated symbols for batch scan."""
     try:
+        from trading_skills.scanner_bullish import compute_bullish_score, scan_symbols
         if "," in symbol:
             symbols_list = [s.strip().upper() for s in symbol.split(",")]
             results = scan_symbols(symbols_list, period=period)
@@ -269,6 +268,7 @@ def scan_bullish(symbol: str, period: str = "12mo") -> dict:
 def scan_pmcc(symbol: str) -> dict:
     """Analyze symbol for PMCC (Poor Man's Covered Call) suitability. Pass comma-separated for batch."""
     try:
+        from trading_skills.scanner_pmcc import analyze_pmcc, format_scan_results
         if "," in symbol:
             symbols_list = [s.strip().upper() for s in symbol.split(",")]
             results = [analyze_pmcc(s) for s in symbols_list]
