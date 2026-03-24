@@ -867,12 +867,12 @@ def _compute_indicators_impl(
     rsi_indicators = result.get("indicators", {}).get("rsi", {})
     macd_indicators = result.get("indicators", {}).get("macd", {})
 
-    # Preserve the detailed trend dict under trend_detail; expose simplified string as trend
-    trend_detail = result.get("trend", {})
-    trend_label = trend_detail.get("label", "neutral") if isinstance(trend_detail, dict) else "neutral"
+    # result["trend"] keeps its original dict form (backward compat with existing tests/callers).
+    # Add simplified flat fields for MCP consumers that want quick access.
+    trend_dict = result.get("trend", {})
+    trend_label = trend_dict.get("label", "neutral") if isinstance(trend_dict, dict) else "neutral"
 
-    result["trend_detail"] = trend_detail
-    result["trend"] = "bullish" if trend_label in ("bull", "strong_bull") else "bearish"
+    result["trend_label"] = "bullish" if trend_label in ("bull", "strong_bull") else "bearish"
     result["sma_20"] = sma_indicators.get("sma20") if sma_indicators.get("sma20") else (round(raw["sma20"], 2) if raw.get("sma20") else None)
     result["sma_50"] = sma_indicators.get("sma50") if sma_indicators.get("sma50") else (round(raw["sma50"], 2) if raw.get("sma50") else None)
     result["ema_20"] = round(ema20_val, 2) if ema20_val is not None else None

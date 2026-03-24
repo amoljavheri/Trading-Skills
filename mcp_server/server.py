@@ -291,6 +291,20 @@ def report_stock(symbol: str) -> dict:
         return {"error": str(e), "symbol": symbol.upper()}
 
 
+@mcp.tool()
+def calculate_csp_candidates(symbols: str, expiry: str) -> dict:
+    """Find and rank Cash Secured Put candidates. symbols: comma-separated (e.g. 'AMD,NVDA,TSLA'). expiry: YYYY-MM-DD option expiration."""
+    try:
+        from trading_skills.csp_candidates import calculate_csp_candidates as _calc
+        symbols_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if not symbols_list:
+            return {"error": "No symbols provided", "symbols": symbols}
+        candidates = _calc(symbols_list, expiry)
+        return {"candidates": candidates, "count": len(candidates), "expiry": expiry}
+    except Exception as e:
+        return {"error": str(e), "symbols": symbols}
+
+
 def main() -> None:
     """Entry point for trading-skills-mcp script and Docker CMD."""
     mcp.run(transport="streamable-http")
