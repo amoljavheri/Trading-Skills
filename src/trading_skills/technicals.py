@@ -1,12 +1,152 @@
-# ABOUTME: Computes technical indicators using pandas-ta.
+# ABOUTME: Computes technical indicators using pure pandas (no pandas-ta dependency).
 # ABOUTME: Trend, volume, support/resistance, confluence, and risk metrics.
 
 import math
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
+
+# ---------------------------------------------------------------------------
+# Pure-pandas indicator helpers — no pandas_ta dependency
+# ---------------------------------------------------------------------------
+
+
+def _sma(series: pd.Series, length: int) -> pd.Series:
+    """Simple Moving Average."""
+    return series.rolling(window=length).mean()
+
+
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    """Exponential Moving Average."""
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    """Relative Strength Index using Wilder smoothing."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _macd(
+    series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.DataFrame:
+    """MACD — DataFrame columns: [MACD line, Signal, Histogram] (positional 0/1/2)."""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return pd.DataFrame(
+        {"MACD": macd_line, "MACDs": signal_line, "MACDh": histogram},
+        index=series.index,
+    )
+
+
+def _bbands(
+    series: pd.Series, length: int = 20, std: float = 2.0
+) -> pd.DataFrame:
+    """Bollinger Bands — DataFrame columns: [lower, middle, upper] (positional 0/1/2)."""
+    mid = series.rolling(window=length).mean()
+    dev = series.rolling(window=length).std(ddof=0)
+    lower = mid - std * dev
+    upper = mid + std * dev
+    return pd.DataFrame({"BBL": lower, "BBM": mid, "BBU": upper}, index=series.index)
+
+
+def _atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14
+) -> pd.Series:
+    """Average True Range using Wilder smoothing."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def _adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14
+) -> pd.DataFrame:
+    """Average Directional Index — DataFrame columns: [ADX, +DI, -DI] (positional 0/1/2)."""
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+    up_move = high - prev_high
+    down_move = prev_low - low
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=close.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=close.index,
+    )
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    smoothed_pdm = plus_dm.ewm(alpha=1 / length, adjust=False).mean()
+    smoothed_mdm = minus_dm.ewm(alpha=1 / length, adjust=False).mean()
+    plus_di = 100 * smoothed_pdm / atr
+    minus_di = 100 * smoothed_mdm / atr
+    dx_denom = plus_di + minus_di
+    dx = pd.Series(
+        np.where(dx_denom > 0, 100 * (plus_di - minus_di).abs() / dx_denom, 0.0),
+        index=close.index,
+    )
+    adx_series = dx.ewm(alpha=1 / length, adjust=False).mean()
+    return pd.DataFrame(
+        {f"ADX_{length}": adx_series, f"DMP_{length}": plus_di, f"DMN_{length}": minus_di},
+        index=close.index,
+    )
+
+
+def _stochrsi(
+    series: pd.Series,
+    length: int = 14,
+    rsi_length: int = 14,
+    k: int = 3,
+    d: int = 3,
+) -> pd.DataFrame:
+    """Stochastic RSI — DataFrame columns: [%K, %D] (positional 0/1)."""
+    rsi = _rsi(series, rsi_length)
+    rsi_min = rsi.rolling(length).min()
+    rsi_max = rsi.rolling(length).max()
+    denom = rsi_max - rsi_min
+    stoch = pd.Series(
+        np.where(denom > 0, (rsi - rsi_min) / denom * 100, 50.0),
+        index=series.index,
+    )
+    k_series = stoch.rolling(k).mean()
+    d_series = k_series.rolling(d).mean()
+    return pd.DataFrame(
+        {"STOCHRSIk": k_series, "STOCHRSId": d_series}, index=series.index
+    )
+
+
+def _roc(series: pd.Series, length: int = 12) -> pd.Series:
+    """Rate of Change."""
+    return series.pct_change(length) * 100
+
+
+def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On Balance Volume."""
+    direction = np.sign(close.diff()).fillna(0)
+    return (volume * direction).cumsum()
+
+
+def _vwap(
+    high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series
+) -> pd.Series:
+    """Volume Weighted Average Price (cumulative session)."""
+    typical = (high + low + close) / 3
+    return (typical * volume).cumsum() / volume.cumsum()
 
 from trading_skills.earnings import get_next_earnings_date
 from trading_skills.utils import annualized_volatility
@@ -113,34 +253,34 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
     close = df["Close"]
 
     # RSI
-    rsi = ta.rsi(close, length=14)
+    rsi = _rsi(close, 14)
     if rsi is not None and len(rsi) > 0:
         val = rsi.iloc[-1]
         if pd.notna(val):
             result["rsi"] = float(val)
 
     # SMA
-    sma20 = ta.sma(close, length=20)
+    sma20 = _sma(close, 20)
     if sma20 is not None and len(sma20) > 0:
         val = sma20.iloc[-1]
         if pd.notna(val):
             result["sma20"] = float(val)
 
-    sma50 = ta.sma(close, length=50)
+    sma50 = _sma(close, 50)
     if sma50 is not None and len(sma50) > 0:
         val = sma50.iloc[-1]
         if pd.notna(val):
             result["sma50"] = float(val)
 
     # SMA200 — requires at least 200 bars (need period="12mo" or longer)
-    sma200 = ta.sma(close, length=200)
+    sma200 = _sma(close, 200)
     if sma200 is not None and len(sma200) > 0:
         val = sma200.iloc[-1]
         if pd.notna(val):
             result["sma200"] = float(val)
 
     # MACD
-    macd = ta.macd(close)
+    macd = _macd(close)
     if macd is not None and len(macd) > 0:
         line = macd.iloc[-1, 0]
         signal = macd.iloc[-1, 1]
@@ -158,7 +298,7 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
 
     # ADX
     if "High" in df.columns and "Low" in df.columns:
-        adx = ta.adx(df["High"], df["Low"], close, length=14)
+        adx = _adx(df["High"], df["Low"], close, 14)
         if adx is not None and len(adx) > 0:
             adx_val = adx.iloc[-1, 0]
             dmp_val = adx.iloc[-1, 1]
@@ -171,7 +311,7 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
                 result["dmn"] = float(dmn_val)
 
     # Stochastic RSI
-    stoch_rsi = ta.stochrsi(close, length=14, rsi_length=14, k=3, d=3)
+    stoch_rsi = _stochrsi(close, 14, 14, 3, 3)
     if stoch_rsi is not None and len(stoch_rsi) > 0:
         k_val = stoch_rsi.iloc[-1, 0]
         d_val = stoch_rsi.iloc[-1, 1]
@@ -181,7 +321,7 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
             result["stoch_rsi_d"] = float(d_val)
 
     # Rate of Change (12-period)
-    roc = ta.roc(close, length=12)
+    roc = _roc(close, 12)
     if roc is not None and len(roc) > 0:
         val = roc.iloc[-1]
         if pd.notna(val):
@@ -192,12 +332,12 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
         volume = df["Volume"]
 
         # On Balance Volume
-        obv = ta.obv(close, volume)
+        obv = _obv(close, volume)
         if obv is not None and len(obv) > 0:
             val = obv.iloc[-1]
             if pd.notna(val):
                 result["obv"] = float(val)
-            obv_sma = ta.sma(obv, length=20)
+            obv_sma = _sma(obv, 20)
             if obv_sma is not None and len(obv_sma) > 0:
                 sma_val = obv_sma.iloc[-1]
                 if pd.notna(sma_val):
@@ -212,7 +352,7 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
                 result["relative_volume"] = float(cur_val / avg_val)
 
     # Bollinger Bands (20, 2)
-    bb = ta.bbands(close, length=20, std=2)
+    bb = _bbands(close, 20, 2.0)
     if bb is not None and len(bb) > 0:
         lower = bb.iloc[-1, 0]
         mid = bb.iloc[-1, 1]
@@ -228,14 +368,14 @@ def compute_raw_indicators(df: pd.DataFrame) -> dict:
 
     # ATR (14-period)
     if "High" in df.columns and "Low" in df.columns:
-        atr = ta.atr(df["High"], df["Low"], close, length=14)
+        atr = _atr(df["High"], df["Low"], close, 14)
         if atr is not None and len(atr) > 0:
             val = atr.iloc[-1]
             if pd.notna(val):
                 result["atr"] = float(val)
 
     # Trend consistency: count of last 20 days where close > SMA20
-    sma20_for_consistency = ta.sma(close, length=20)
+    sma20_for_consistency = _sma(close, 20)
     if sma20_for_consistency is not None and len(sma20_for_consistency) >= 20:
         last_20_close = close.iloc[-20:]
         last_20_sma = sma20_for_consistency.iloc[-20:]
@@ -407,6 +547,19 @@ def compute_indicators(
         include_earnings: Include earnings data
         include_beta: Include beta vs SPY (requires extra data fetch)
     """
+    try:
+        return _compute_indicators_impl(symbol, period, indicators, include_earnings, include_beta)
+    except Exception as exc:
+        return {"error": str(exc), "fallback": True, "symbol": symbol.upper()}
+
+
+def _compute_indicators_impl(
+    symbol: str,
+    period: str = "3mo",
+    indicators: list[str] | None = None,
+    include_earnings: bool = False,
+    include_beta: bool = False,
+) -> dict:
     if indicators is None:
         indicators = ["rsi", "macd", "bb", "sma", "ema", "atr", "adx", "vwap", "sr"]
 
@@ -414,7 +567,7 @@ def compute_indicators(
     df = ticker.history(period=period)
 
     if df.empty:
-        return {"error": f"No data for {symbol}"}
+        return {"error": f"No data for {symbol}", "fallback": True}
 
     current_price = df["Close"].iloc[-1]
 
@@ -500,7 +653,7 @@ def compute_indicators(
 
     # --- Bollinger Bands ---
     if "bb" in indicators:
-        bb = ta.bbands(df["Close"], length=20, std=2)
+        bb = _bbands(df["Close"], 20, 2.0)
         if bb is not None and len(bb) > 0:
             lower = bb.iloc[-1, 0]
             mid = bb.iloc[-1, 1]
@@ -530,8 +683,8 @@ def compute_indicators(
         if raw["sma50"] is not None:
             result["indicators"]["sma"]["sma50"] = round(raw["sma50"], 2)
             # Golden/death cross needs previous values
-            sma20 = ta.sma(df["Close"], length=20)
-            sma50 = ta.sma(df["Close"], length=50)
+            sma20 = _sma(df["Close"], 20)
+            sma50 = _sma(df["Close"], 50)
             if sma20 is not None and sma50 is not None and len(sma20) > 1 and len(sma50) > 1:
                 if sma20.iloc[-2] < sma50.iloc[-2] and sma20.iloc[-1] > sma50.iloc[-1]:
                     sig = {"indicator": "SMA", "signal": "golden_cross"}
@@ -548,8 +701,8 @@ def compute_indicators(
 
     # --- EMA ---
     if "ema" in indicators:
-        ema12 = ta.ema(df["Close"], length=12)
-        ema26 = ta.ema(df["Close"], length=26)
+        ema12 = _ema(df["Close"], 12)
+        ema26 = _ema(df["Close"], 26)
         result["indicators"]["ema"] = {}
         if ema12 is not None and len(ema12) > 0:
             result["indicators"]["ema"]["ema12"] = round(ema12.iloc[-1], 2)
@@ -558,7 +711,7 @@ def compute_indicators(
 
     # --- ATR ---
     if "atr" in indicators:
-        atr = ta.atr(df["High"], df["Low"], df["Close"], length=14)
+        atr = _atr(df["High"], df["Low"], df["Close"], 14)
         if atr is not None and len(atr) > 0:
             result["indicators"]["atr"] = {
                 "value": round(atr.iloc[-1], 2),
@@ -585,7 +738,7 @@ def compute_indicators(
 
     # --- VWAP ---
     if "vwap" in indicators and "Volume" in df.columns:
-        vwap = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"])
+        vwap = _vwap(df["High"], df["Low"], df["Close"], df["Volume"])
         if vwap is not None and len(vwap) > 0:
             vwap_val = vwap.iloc[-1]
             if pd.notna(vwap_val):
@@ -705,6 +858,26 @@ def compute_indicators(
 
     if include_earnings:
         result["earnings"] = get_earnings_data(symbol)
+
+    # --- Top-level summary fields (always present for MCP consumers) ---
+    ema20_series = _ema(df["Close"], 20)
+    ema20_val = float(ema20_series.iloc[-1]) if pd.notna(ema20_series.iloc[-1]) else None
+
+    sma_indicators = result.get("indicators", {}).get("sma", {})
+    rsi_indicators = result.get("indicators", {}).get("rsi", {})
+    macd_indicators = result.get("indicators", {}).get("macd", {})
+
+    # Preserve the detailed trend dict under trend_detail; expose simplified string as trend
+    trend_detail = result.get("trend", {})
+    trend_label = trend_detail.get("label", "neutral") if isinstance(trend_detail, dict) else "neutral"
+
+    result["trend_detail"] = trend_detail
+    result["trend"] = "bullish" if trend_label in ("bull", "strong_bull") else "bearish"
+    result["sma_20"] = sma_indicators.get("sma20") if sma_indicators.get("sma20") else (round(raw["sma20"], 2) if raw.get("sma20") else None)
+    result["sma_50"] = sma_indicators.get("sma50") if sma_indicators.get("sma50") else (round(raw["sma50"], 2) if raw.get("sma50") else None)
+    result["ema_20"] = round(ema20_val, 2) if ema20_val is not None else None
+    result["rsi"] = rsi_indicators.get("value") if rsi_indicators.get("value") else (round(raw["rsi"], 2) if raw.get("rsi") else None)
+    result["macd"] = macd_indicators if macd_indicators else None
 
     return result
 
