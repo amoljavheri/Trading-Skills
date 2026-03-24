@@ -28,13 +28,14 @@ steps:
       - '--region=us-central1'
       - '--platform=managed'
       - '--allow-unauthenticated'
-      - '--memory=1Gi'
+      - '--memory=2Gi'
       - '--cpu=1'
       - '--min-instances=0'
       - '--max-instances=10'
       - '--port=8080'
       - '--set-env-vars=PORT=8080'
       - '--timeout=300'
+      - '--startup-cpu-boost'
 
 images:
   - 'gcr.io/$PROJECT_ID/trading-skills:$COMMIT_SHA'
