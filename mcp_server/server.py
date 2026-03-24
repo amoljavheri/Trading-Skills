@@ -28,7 +28,7 @@ from trading_skills.spreads import (
 )
 from trading_skills.technicals import compute_indicators
 
-mcp = FastMCP("trading-skills")
+mcp = FastMCP("trading-skills", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 
 @mcp.tool()
@@ -293,8 +293,7 @@ def report_stock(symbol: str) -> dict:
 
 def main() -> None:
     """Entry point for trading-skills-mcp script and Docker CMD."""
-    port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
