@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Development directories - not needed in container
+sandbox/
+tests/
+Etrade Files/
+
+# Version control
+.git/
+.gitignore
+
+# Claude / IDE config
+.claude/
+.vscode/
+.idea/
+
+# Environment files - never bake into image
+.env
+.env.*
+*.env
+
+# Documentation and assets
+assets/
+*.md
+
+# OS files
+.DS_Store
+Thumbs.db
