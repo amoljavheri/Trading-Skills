@@ -30,6 +30,7 @@ Etrade Files/
 # Documentation and assets
 assets/
 *.md
+!README.md
 
 # OS files
 .DS_Store
