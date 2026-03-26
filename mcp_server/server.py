@@ -305,6 +305,33 @@ def calculate_csp_candidates(symbols: str, expiry: str) -> dict:
         return {"error": str(e), "symbols": symbols}
 
 
+@mcp.tool()
+def analyze_portfolio(
+    positions_json: str,
+    portfolio_cash: float = 0.0,
+    risk_profile: str = "moderate",
+) -> dict:
+    """Analyze a full portfolio of stocks and options. Returns per-position decisions, scores,
+    risks, and opportunities. positions_json: JSON array where each entry has {symbol,
+    type ('stock'/'call'/'put'), quantity (negative=short), cost_basis, expiry (YYYY-MM-DD,
+    options only), strike (options only)}. portfolio_cash: uninvested cash ($).
+    risk_profile: 'conservative'|'moderate'|'aggressive'."""
+    try:
+        import json as _json
+        from trading_skills.portfolio_analyzer import analyze_portfolio as _analyze
+        try:
+            pos_list = _json.loads(positions_json)
+        except _json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON in positions_json: {e}"}
+        if not isinstance(pos_list, list):
+            return {"error": "positions_json must be a JSON array"}
+        if not pos_list:
+            return {"error": "positions_json array is empty"}
+        return _analyze(pos_list, portfolio_cash=portfolio_cash, risk_profile=risk_profile)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def main() -> None:
     """Entry point for trading-skills-mcp script and Docker CMD."""
     mcp.run(transport="streamable-http")
