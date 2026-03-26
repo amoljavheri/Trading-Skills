@@ -73,7 +73,7 @@ PORTFOLIO_CONFIG: dict = {
     },
     "iv_normalization_cap": 60.0,
     "nearest_expiry_target_dte": 30,
-    "near_support_range": (-3.0, 5.0),
+    "near_support_range": (-3.0, 2.0),    # upper bound: >2% above SMA20 is no longer "at support"
     "near_resistance_pct": 3.0,
     "fundamentals_accept_assignment": 60.0,
     "data_quality_thresholds": {"good": 1, "partial": 3},
@@ -515,15 +515,23 @@ def _compute_sr_context(price: float, bull_result: dict | None, config: dict) ->
     sr_lo, sr_hi = config["near_support_range"]
     nr_pct = config["near_resistance_pct"]
 
-    near_support: bool | None = None
-    if pct_from_sma20 is not None:
-        near_support = sr_lo <= float(pct_from_sma20) <= sr_hi
-
     near_resistance: bool | None = None
     pct_below_20d_high: float | None = None
     if high_20d and float(high_20d) > 0:
         pct_below_20d_high = (float(high_20d) - price) / float(high_20d) * 100
         near_resistance = 0.0 <= pct_below_20d_high <= nr_pct
+
+    # near_support: within SMA20 range AND not close to 20d high (prevents labeling
+    # strong uptrends as support). Requires pct_below_20d_high > 5% to confirm.
+    near_support: bool | None = None
+    if pct_from_sma20 is not None:
+        in_sma20_range = sr_lo <= float(pct_from_sma20) <= sr_hi
+        if not in_sma20_range:
+            near_support = False
+        elif pct_below_20d_high is not None:
+            near_support = pct_below_20d_high > 5.0
+        else:
+            near_support = None  # high_20d unavailable — cannot confirm
 
     return {
         "near_support": near_support,
