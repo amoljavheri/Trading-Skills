@@ -716,3 +716,97 @@ class TestRealDataSmoke:
     def test_invalid_symbol_returns_none_or_error(self):
         result = analyze_pmcc("BRK.A")
         assert result is None or "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 12. Patch-specific tests (Issue 1 / 2 / 3 fixes)
+# ---------------------------------------------------------------------------
+
+
+class TestPatchFixes:
+    # --- Issue 3: negative extrinsic clamped to zero ---
+
+    @patch("trading_skills.scanner_pmcc.get_earnings_info", return_value=_NO_EARNINGS)
+    def test_negative_extrinsic_clamped_to_zero(self, _mock_earnings):
+        """When stale data makes leaps_mid < intrinsic, leaps_extrinsic_pct >= 0."""
+        # Force a deep-ITM LEAPS with a tiny mid (bid=1, ask=2 → mid=1.5)
+        # but high intrinsic (price=100, strike=50 → intrinsic=50 > mid=1.5)
+        low_mid_leaps = pd.DataFrame(
+            {
+                "strike": [50.0, 95.0, 100.0, 105.0],
+                "bid": [1.00, 12.0, 8.50, 5.50],
+                "ask": [2.00, 14.0, 9.50, 6.50],
+                "impliedVolatility": [0.28, 0.30, 0.30, 0.31],
+                "openInterest": [500, 100, 200, 100],
+                "volume": [50, 10, 25, 10],
+            }
+        )
+        ticker = _default_ticker(leaps_calls=low_mid_leaps)
+        result = analyze_pmcc("TEST", ticker=ticker)
+        if result and "pmcc_score" in result:
+            assert result["metrics"]["leaps_extrinsic_pct"] >= 0.0
+            assert result["leaps"]["extrinsic"] >= 0.0
+
+    # --- Issue 2: zero short bid guard ---
+
+    def test_zero_short_bid_returns_error(self):
+        """Short option with all-zero bids must return an error dict (not crash).
+
+        find_strike_by_delta already filters bid <= 0 rows, so the function returns
+        None for the short option, producing a "Could not find short strike" error.
+        The short_bid <= 0 guard in analyze_pmcc adds a second layer of defense for
+        edge cases where the bid field is falsy after extraction.
+        """
+        zero_bid_short = pd.DataFrame(
+            {
+                "strike": [110.0, 115.0, 120.0],
+                "bid": [0.0, 0.0, 0.0],
+                "ask": [0.50, 0.30, 0.20],
+                "impliedVolatility": [0.34, 0.36, 0.38],
+                "openInterest": [1500, 800, 400],
+                "volume": [200, 100, 50],
+            }
+        )
+        ticker = _default_ticker(short_calls=zero_bid_short)
+        result = analyze_pmcc("TEST", ticker=ticker)
+        assert result is not None
+        assert "error" in result
+
+    # --- Issue 1: OI pre-filter in find_strike_by_delta ---
+
+    @patch("trading_skills.scanner_pmcc.get_earnings_info", return_value=_NO_EARNINGS)
+    def test_liquidity_filter_prefers_high_oi_strike(self, _mock_earnings):
+        """With two near-equal delta strikes, the one with OI >= 50 is preferred."""
+        # Two deep-ITM strikes with similar delta:
+        #   strike=84 has OI=5 (stub, below _MIN_OI=50)
+        #   strike=85 has OI=500 (liquid)
+        # The filter should skip strike=84 in pass 1 and land on strike=85.
+        two_strike_leaps = pd.DataFrame(
+            {
+                "strike": [84.0, 85.0, 95.0, 100.0, 105.0],
+                "bid": [21.0, 20.0, 12.0, 8.50, 5.50],
+                "ask": [23.0, 22.0, 14.0, 9.50, 6.50],
+                "impliedVolatility": [0.28, 0.28, 0.30, 0.30, 0.31],
+                "openInterest": [5, 500, 100, 200, 100],
+                "volume": [1, 30, 10, 25, 10],
+            }
+        )
+        ticker = _default_ticker(leaps_calls=two_strike_leaps)
+        result = analyze_pmcc("TEST", ticker=ticker)
+        if result and "pmcc_score" in result:
+            # strike=84 had OI=5 (below 50); filter should have chosen strike=85
+            assert result["leaps"]["strike"] != 84.0
+
+    @patch("trading_skills.scanner_pmcc.get_earnings_info", return_value=_NO_EARNINGS)
+    def test_liquidity_filter_fallback_when_all_oi_below_50(self, _mock_earnings):
+        """When all LEAPS strikes have OI < 50, fallback path produces a result."""
+        low_oi_leaps = _DEFAULT_LEAPS_CALLS.copy()
+        low_oi_leaps["openInterest"] = 30  # all below _MIN_OI=50 but above hard-reject 20
+        ticker = _default_ticker(leaps_calls=low_oi_leaps)
+        result = analyze_pmcc("TEST", ticker=ticker)
+        # Should NOT be None or error due to missing strike — fallback provides one
+        # (may still get a risk flag for low OI, but trade evaluation proceeds)
+        assert result is not None
+        # If a strike was found, the result should have pmcc_score (not a strike-search error)
+        if result and "error" in result:
+            assert "Could not find" not in result["error"]

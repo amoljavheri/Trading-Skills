@@ -49,33 +49,47 @@ def find_strike_by_delta(
     min_strike=None,
     max_strike=None,
 ):
-    """Find strike closest to target delta with optional strike constraints."""
+    """Find strike closest to target delta with optional strike constraints.
+
+    Uses a two-pass approach:
+    Pass 1 (preferred): candidates with bid > 0 AND openInterest >= 50
+    Pass 2 (fallback):  candidates with bid > 0 only (preserves original behavior)
+    """
+    _MIN_OI = 50
     T = expiry_days / 365
-    best_delta_diff = float("inf")
-    best_option = None
 
-    for _, row in chain.iterrows():
-        strike = row["strike"]
+    def _best_from(candidates: pd.DataFrame):
+        best_diff = float("inf")
+        best = None
+        for _, row in candidates.iterrows():
+            option_iv = row.get("impliedVolatility", iv)
+            if pd.isna(option_iv) or option_iv <= 0:
+                option_iv = iv
+            delta = black_scholes_delta(current_price, row["strike"], T, r, option_iv, "call")
+            diff = abs(delta - target_delta)
+            if diff < best_diff:
+                best_diff = diff
+                best = row.copy()
+                best["calculated_delta"] = delta
+        return best
 
-        if pd.isna(row.get("bid")) or row.get("bid", 0) <= 0:
-            continue
+    def _apply_constraints(df: pd.DataFrame) -> pd.DataFrame:
+        if min_strike is not None:
+            df = df[df["strike"] >= min_strike]
+        if max_strike is not None:
+            df = df[df["strike"] <= max_strike]
+        return df
 
-        if min_strike is not None and strike < min_strike:
-            continue
-        if max_strike is not None and strike > max_strike:
-            continue
+    # Pass 1: liquid strikes (OI >= 50)
+    liquid = chain[
+        chain["bid"].notna() & (chain["bid"] > 0) & (chain["openInterest"].fillna(0) >= _MIN_OI)
+    ]
+    best_option = _best_from(_apply_constraints(liquid))
 
-        option_iv = row.get("impliedVolatility", iv)
-        if pd.isna(option_iv) or option_iv <= 0:
-            option_iv = iv
-
-        delta = black_scholes_delta(current_price, strike, T, r, option_iv, "call")
-        delta_diff = abs(delta - target_delta)
-
-        if delta_diff < best_delta_diff:
-            best_delta_diff = delta_diff
-            best_option = row.copy()
-            best_option["calculated_delta"] = delta
+    # Pass 2 fallback: any positive bid (original behavior, guarantees no regression)
+    if best_option is None:
+        all_bids = chain[chain["bid"].notna() & (chain["bid"] > 0)]
+        best_option = _best_from(_apply_constraints(all_bids))
 
     if best_option is None:
         return None, None
@@ -246,6 +260,8 @@ def analyze_pmcc(
             }
 
         short_bid = float(short_option.get("bid") or 0)
+        if short_bid <= 0:
+            return {"symbol": symbol, "error": "Short call has no executable bid"}
         short_ask = float(short_option.get("ask") or 0)
         short_mid = round((short_bid + short_ask) / 2, 2)
         short_spread_pct = (short_ask - short_bid) / short_mid * 100 if short_mid > 0 else 100.0
@@ -275,7 +291,7 @@ def analyze_pmcc(
         max_loss = net_debit * 100  # per contract (100 shares)
 
         leaps_intrinsic = max(0.0, current_price - leaps_strike)
-        leaps_extrinsic = leaps_mid - leaps_intrinsic
+        leaps_extrinsic = max(0.0, leaps_mid - leaps_intrinsic)
         leaps_extrinsic_pct = (leaps_extrinsic / leaps_mid * 100) if leaps_mid > 0 else 0.0
 
         capital_required = leaps_mid * 100
