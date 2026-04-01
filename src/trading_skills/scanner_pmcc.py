@@ -97,17 +97,67 @@ def find_strike_by_delta(
 
 
 def _compute_atm_iv_median(chain_df: pd.DataFrame, current_price: float) -> float | None:
-    """Return median implied volatility of ATM calls (strike within ±5% of price)."""
+    """Return median implied volatility of ATM calls (strike within ±5% of price).
+
+    impliedVolatility values must be in decimal form (e.g. 0.38, not 38.0).
+    Returns None when no valid IV values are found in the ATM window.
+    """
     atm = chain_df[
         (chain_df["strike"] >= current_price * 0.95) & (chain_df["strike"] <= current_price * 1.05)
     ]
-    if atm.empty:
-        return None
-    vals = atm["impliedVolatility"].dropna()
+    vals = atm["impliedVolatility"].dropna() if not atm.empty else pd.Series(dtype=float)
     if vals.empty:
         return None
     med = float(vals.median())
     return med if med > 0 else None
+
+
+def _tradier_calls_to_df(tradier_chain: dict) -> pd.DataFrame:
+    """Convert raw Tradier get_options_chain JSON to a calls DataFrame.
+
+    Extracts only call options, normalising field names to match the yfinance
+    chain.calls DataFrame format expected by find_strike_by_delta and
+    _compute_atm_iv_median.
+
+    impliedVolatility is stored as a decimal (e.g. 0.38, not 38.0) — Tradier
+    greeks.mid_iv is already in decimal form so no conversion is needed.
+
+    Handles the MCP wrapper format: [{"type": "text", "text": "<json string>"}].
+    """
+    if isinstance(tradier_chain, list) and tradier_chain and "text" in tradier_chain[0]:
+        import json as _json
+        tradier_chain = _json.loads(tradier_chain[0]["text"])
+
+    options_list: list = []
+    try:
+        options_list = tradier_chain["options"]["option"]
+    except (KeyError, TypeError):
+        pass
+
+    rows = []
+    for o in options_list:
+        if o.get("option_type", "").lower() != "call":
+            continue
+        greeks = o.get("greeks") or {}
+        mid_iv = greeks.get("mid_iv")  # already decimal from Tradier
+        rows.append({
+            "strike": float(o.get("strike", 0)),
+            "bid": float(o.get("bid") or 0),
+            "ask": float(o.get("ask") or 0),
+            "openInterest": int(o.get("open_interest") or 0),
+            "volume": int(o.get("volume") or 0),
+            "impliedVolatility": float(mid_iv) if mid_iv is not None else float("nan"),
+        })
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["strike", "bid", "ask", "openInterest", "volume", "impliedVolatility"]
+        )
+
+    df = pd.DataFrame(rows)
+    df.sort_values("strike", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
 
 def analyze_pmcc(
@@ -117,8 +167,21 @@ def analyze_pmcc(
     leaps_delta: float = 0.80,
     short_delta: float = 0.20,
     ticker=None,
+    tradier_leaps_chain: dict | None = None,
+    tradier_leaps_expiry: str | None = None,
+    tradier_short_chain: dict | None = None,
+    tradier_short_expiry: str | None = None,
+    tradier_price: float | None = None,
 ) -> dict | None:
     """Analyze a symbol for PMCC suitability.
+
+    When tradier_leaps_chain, tradier_leaps_expiry, tradier_short_chain, and
+    tradier_short_expiry are all provided, option chain data is sourced entirely
+    from Tradier (no yfinance option chain calls). tradier_price is used as the
+    current price when supplied.
+
+    Falls back to yfinance for option chains when Tradier params are absent
+    (legacy path, kept for backward compatibility).
 
     Returns a result dict with pmcc_score (0–10), detailed LEAPS/short leg data,
     metrics (breakeven, yield, downside protection), risk_flags, and earnings info.
@@ -126,95 +189,144 @@ def analyze_pmcc(
     Returns None when basic data (price, options list) is unavailable.
     """
     try:
-        ticker = ticker or yf.Ticker(symbol)
-        info = ticker.info
-        current_price = get_current_price(info)
-
-        if not current_price:
-            hist = ticker.history(period="5d")
-            if hist.empty:
-                return None
-            current_price = float(hist["Close"].iloc[-1])
-
-        expirations = ticker.options
-        if not expirations:
-            return {"symbol": symbol, "error": "No options available"}
-
         today = datetime.now()
 
-        # --- Step 1: LEAPS expiry selection ---
-        # Primary: closest to 452 DTE within 365–540 day ideal range
-        # Fallback: nearest expiry >= 270 days
-        ideal_candidates: list[tuple[str, int]] = []
-        fallback_expiry: str | None = None
-        fallback_days = 0
+        _use_tradier = (
+            tradier_leaps_chain is not None
+            and tradier_leaps_expiry is not None
+            and tradier_short_chain is not None
+            and tradier_short_expiry is not None
+        )
 
-        for exp in expirations:
-            exp_date = datetime.strptime(exp, "%Y-%m-%d")
-            days_to_exp = (exp_date - today).days
-            if _LEAPS_IDEAL_MIN_DTE <= days_to_exp <= _LEAPS_IDEAL_MAX_DTE:
-                ideal_candidates.append((exp, days_to_exp))
-            if days_to_exp >= _LEAPS_FALLBACK_MIN_DTE and fallback_expiry is None:
-                fallback_expiry = exp
-                fallback_days = days_to_exp
+        if _use_tradier:
+            # --- Tradier path: option chains from Tradier API ---
+            if tradier_price and tradier_price > 0:
+                current_price = float(tradier_price)
+            else:
+                # Price fallback: yfinance quote (not option chain)
+                _ticker = ticker or yf.Ticker(symbol)
+                info = _ticker.info
+                current_price = get_current_price(info)
+                if not current_price:
+                    hist = _ticker.history(period="5d")
+                    if hist.empty:
+                        return None
+                    current_price = float(hist["Close"].iloc[-1])
 
-        if ideal_candidates:
-            best = min(ideal_candidates, key=lambda x: abs(x[1] - _LEAPS_TARGET_DTE))
-            leaps_expiry, leaps_days = best
-        elif fallback_expiry:
-            leaps_expiry, leaps_days = fallback_expiry, fallback_days
+            leaps_expiry = tradier_leaps_expiry
+            leaps_days = (datetime.strptime(leaps_expiry, "%Y-%m-%d") - today).days
+            short_expiry = tradier_short_expiry
+            short_days = (datetime.strptime(short_expiry, "%Y-%m-%d") - today).days
+
+            if leaps_days < min_leaps_days:
+                return {
+                    "symbol": symbol,
+                    "error": f"LEAPS expiry too near ({leaps_days} days < {min_leaps_days})",
+                }
+            if short_days < 7:
+                return {
+                    "symbol": symbol,
+                    "error": "No suitable short-term expiry found (min 7 DTE required)",
+                }
+
+            leaps_calls_df = _tradier_calls_to_df(tradier_leaps_chain)
+            short_calls_df = _tradier_calls_to_df(tradier_short_chain)
+
+            if leaps_calls_df.empty:
+                return {"symbol": symbol, "error": "LEAPS chain has no call options"}
+            if short_calls_df.empty:
+                return {"symbol": symbol, "error": "Short chain has no call options"}
+
         else:
-            return {
-                "symbol": symbol,
-                "error": f"No LEAPS expiry >= {_LEAPS_FALLBACK_MIN_DTE} days found",
-            }
+            # --- yfinance path (legacy fallback) ---
+            _ticker = ticker or yf.Ticker(symbol)
+            info = _ticker.info
+            current_price = get_current_price(info)
 
-        # --- Step 3: Short-term expiry selection ---
-        # Primary: 21–45 DTE; Fallback: 7–21 DTE; Hard floor: 7 DTE
-        short_expiry: str | None = None
-        short_days = 0
+            if not current_price:
+                hist = _ticker.history(period="5d")
+                if hist.empty:
+                    return None
+                current_price = float(hist["Close"].iloc[-1])
 
-        for exp in expirations:
-            exp_date = datetime.strptime(exp, "%Y-%m-%d")
-            days_to_exp = (exp_date - today).days
-            if 21 <= days_to_exp <= 45:
-                short_expiry = exp
-                short_days = days_to_exp
-                break
+            expirations = _ticker.options
+            if not expirations:
+                return {"symbol": symbol, "error": "No options available"}
 
-        if not short_expiry:
+            # LEAPS expiry selection:
+            # Primary: closest to 452 DTE within 365–540 day ideal range
+            # Fallback: nearest expiry >= 270 days
+            ideal_candidates: list[tuple[str, int]] = []
+            fallback_expiry: str | None = None
+            fallback_days = 0
+
             for exp in expirations:
                 exp_date = datetime.strptime(exp, "%Y-%m-%d")
                 days_to_exp = (exp_date - today).days
-                if 7 <= days_to_exp <= 20:
+                if _LEAPS_IDEAL_MIN_DTE <= days_to_exp <= _LEAPS_IDEAL_MAX_DTE:
+                    ideal_candidates.append((exp, days_to_exp))
+                if days_to_exp >= _LEAPS_FALLBACK_MIN_DTE and fallback_expiry is None:
+                    fallback_expiry = exp
+                    fallback_days = days_to_exp
+
+            if ideal_candidates:
+                best = min(ideal_candidates, key=lambda x: abs(x[1] - _LEAPS_TARGET_DTE))
+                leaps_expiry, leaps_days = best
+            elif fallback_expiry:
+                leaps_expiry, leaps_days = fallback_expiry, fallback_days
+            else:
+                return {
+                    "symbol": symbol,
+                    "error": f"No LEAPS expiry >= {_LEAPS_FALLBACK_MIN_DTE} days found",
+                }
+
+            # Short-term expiry selection:
+            # Primary: 21–45 DTE; Fallback: 7–21 DTE; Hard floor: 7 DTE
+            short_expiry: str | None = None
+            short_days = 0
+
+            for exp in expirations:
+                exp_date = datetime.strptime(exp, "%Y-%m-%d")
+                days_to_exp = (exp_date - today).days
+                if 21 <= days_to_exp <= 45:
                     short_expiry = exp
                     short_days = days_to_exp
                     break
 
-        if not short_expiry:
-            return {
-                "symbol": symbol,
-                "error": "No suitable short-term expiry found (min 7 DTE required)",
-            }
+            if not short_expiry:
+                for exp in expirations:
+                    exp_date = datetime.strptime(exp, "%Y-%m-%d")
+                    days_to_exp = (exp_date - today).days
+                    if 7 <= days_to_exp <= 20:
+                        short_expiry = exp
+                        short_days = days_to_exp
+                        break
 
-        # Fetch option chains
-        leaps_chain = ticker.option_chain(leaps_expiry)
-        short_chain = ticker.option_chain(short_expiry)
+            if not short_expiry:
+                return {
+                    "symbol": symbol,
+                    "error": "No suitable short-term expiry found (min 7 DTE required)",
+                }
+
+            leaps_chain = _ticker.option_chain(leaps_expiry)
+            short_chain = _ticker.option_chain(short_expiry)
+            leaps_calls_df = leaps_chain.calls
+            short_calls_df = short_chain.calls
 
         # --- Step 2: Compute separate IVs using median of ATM calls ---
-        leaps_iv = _compute_atm_iv_median(leaps_chain.calls, current_price)
+        leaps_iv = _compute_atm_iv_median(leaps_calls_df, current_price)
         if leaps_iv is None or leaps_iv < 0.05:
             return {"symbol": symbol, "error": "IV data unavailable or implausible"}
 
         short_iv_fallback_used = False
-        short_iv = _compute_atm_iv_median(short_chain.calls, current_price)
+        short_iv = _compute_atm_iv_median(short_calls_df, current_price)
         if short_iv is None or short_iv <= 0:
             short_iv = leaps_iv
             short_iv_fallback_used = True
 
         # --- Find LEAPS call (delta search uses leaps_iv) ---
         leaps_strike, leaps_option = find_strike_by_delta(
-            leaps_chain.calls,
+            leaps_calls_df,
             current_price,
             leaps_delta,
             leaps_days,
@@ -246,7 +358,7 @@ def analyze_pmcc(
 
         # --- Find short call (delta search uses short_iv; must be above LEAPS strike) ---
         short_strike, short_option = find_strike_by_delta(
-            short_chain.calls,
+            short_calls_df,
             current_price,
             short_delta,
             short_days,

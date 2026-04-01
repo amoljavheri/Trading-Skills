@@ -264,16 +264,71 @@ def scan_bullish(symbol: str, period: str = "12mo") -> dict:
 
 
 @mcp.tool()
-def scan_pmcc(symbol: str) -> dict:
-    """Analyze symbol for PMCC (Poor Man's Covered Call) suitability. Pass comma-separated for batch."""
+def scan_pmcc(
+    symbol: str,
+    tradier_leaps_chain_json: str = "",
+    tradier_leaps_expiry: str = "",
+    tradier_short_chain_json: str = "",
+    tradier_short_expiry: str = "",
+    tradier_price: float = 0.0,
+) -> dict:
+    """Analyze symbol for PMCC (Poor Man's Covered Call) suitability.
+    Pass comma-separated for batch.
+
+    For accurate LEAPS IV, provide Tradier option chain data:
+      tradier_leaps_chain_json:  raw JSON string from Tradier get_options_chain for LEAPS expiry
+      tradier_short_chain_json:  raw JSON string from Tradier get_options_chain for short expiry
+      tradier_leaps_expiry:      LEAPS expiration date (YYYY-MM-DD)
+      tradier_short_expiry:      short expiration date (YYYY-MM-DD)
+      tradier_price:             current stock price from Tradier get_quote
+    When all Tradier params are provided, yfinance is not used for option chains.
+    """
+    import json as _json
     try:
         from trading_skills.scanner_pmcc import analyze_pmcc, format_scan_results
+
+        tradier_leaps_chain = None
+        tradier_short_chain = None
+
+        if tradier_leaps_chain_json:
+            try:
+                tradier_leaps_chain = _json.loads(tradier_leaps_chain_json)
+            except _json.JSONDecodeError as e:
+                return {
+                    "error": f"Invalid JSON in tradier_leaps_chain_json: {e}",
+                    "symbol": symbol.upper(),
+                }
+
+        if tradier_short_chain_json:
+            try:
+                tradier_short_chain = _json.loads(tradier_short_chain_json)
+            except _json.JSONDecodeError as e:
+                return {
+                    "error": f"Invalid JSON in tradier_short_chain_json: {e}",
+                    "symbol": symbol.upper(),
+                }
+
+        tradier_kwargs: dict = {}
+        if (
+            tradier_leaps_chain is not None
+            and tradier_leaps_expiry
+            and tradier_short_chain is not None
+            and tradier_short_expiry
+        ):
+            tradier_kwargs = {
+                "tradier_leaps_chain": tradier_leaps_chain,
+                "tradier_leaps_expiry": tradier_leaps_expiry,
+                "tradier_short_chain": tradier_short_chain,
+                "tradier_short_expiry": tradier_short_expiry,
+                "tradier_price": tradier_price if tradier_price > 0 else None,
+            }
+
         if "," in symbol:
             symbols_list = [s.strip().upper() for s in symbol.split(",")]
-            results = [analyze_pmcc(s) for s in symbols_list]
+            results = [analyze_pmcc(s, **tradier_kwargs) for s in symbols_list]
             results = [r for r in results if r is not None]
             return format_scan_results(results)
-        result = analyze_pmcc(symbol)
+        result = analyze_pmcc(symbol, **tradier_kwargs)
         if result is None:
             return {"error": f"No PMCC data for {symbol}", "symbol": symbol.upper()}
         return result

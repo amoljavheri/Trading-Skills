@@ -6,8 +6,9 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
-from trading_skills.scanner_pmcc import analyze_pmcc, format_scan_results
+from trading_skills.scanner_pmcc import _tradier_calls_to_df, analyze_pmcc, format_scan_results
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -272,23 +273,27 @@ class TestTwoIVs:
             assert result["leaps_iv_pct"] < 30.0  # median ≈ 25, not mean ≈ 35
 
     @patch("trading_skills.scanner_pmcc.get_earnings_info", return_value=_NO_EARNINGS)
-    def test_short_iv_fallback_to_leaps_iv_when_no_atm(self, _mock_earnings):
-        """short_iv falls back to leaps_iv when short chain has no ATM strikes."""
-        # Short chain only has deep OTM strikes (outside 95–105 ATM window)
-        short_calls_no_atm = pd.DataFrame(
+    def test_short_iv_fallback_to_leaps_iv_when_all_iv_nan(self, _mock_earnings):
+        """short_iv falls back to leaps_iv only when the entire short chain has NaN IV.
+
+        When non-ATM strikes exist with valid IV, _compute_atm_iv_median now uses
+        those (widened fallback). The leaps_iv fallback only triggers when ALL IV
+        values in the chain are NaN.
+        """
+        short_calls_all_nan_iv = pd.DataFrame(
             {
-                "strike": [130.0, 140.0],
-                "bid": [0.50, 0.30],
-                "ask": [0.70, 0.50],
-                "impliedVolatility": [0.45, 0.50],
-                "openInterest": [200, 100],
-                "volume": [10, 5],
+                "strike": [110.0, 115.0, 120.0],
+                "bid": [2.00, 1.20, 0.70],
+                "ask": [2.20, 1.40, 0.90],
+                "impliedVolatility": [float("nan"), float("nan"), float("nan")],
+                "openInterest": [1500, 800, 400],
+                "volume": [200, 100, 50],
             }
         )
-        ticker = _default_ticker(short_calls=short_calls_no_atm)
+        ticker = _default_ticker(short_calls=short_calls_all_nan_iv)
         result = analyze_pmcc("TEST", ticker=ticker)
         if result and "pmcc_score" in result:
-            # When fallback used, short_iv_pct should equal leaps_iv_pct
+            # All IV NaN → falls back to leaps_iv → values match
             assert result["short_iv_pct"] == result["leaps_iv_pct"]
             # Risk flag should be present
             flags_str = " ".join(result.get("risk_flags", []))
@@ -810,3 +815,142 @@ class TestPatchFixes:
         # If a strike was found, the result should have pmcc_score (not a strike-search error)
         if result and "error" in result:
             assert "Could not find" not in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 12. Tradier integration path
+# ---------------------------------------------------------------------------
+
+
+def _make_tradier_chain(strikes, ivs, ois, bids, asks, option_type="call"):
+    """Build a minimal Tradier get_options_chain JSON dict for testing."""
+    options = []
+    for strike, iv, oi, bid, ask in zip(strikes, ivs, ois, bids, asks):
+        options.append({
+            "option_type": option_type,
+            "strike": strike,
+            "bid": bid,
+            "ask": ask,
+            "open_interest": oi,
+            "volume": 10,
+            "greeks": {"mid_iv": iv, "delta": 0.5},
+        })
+    return {"options": {"option": options}}
+
+
+class TestTradierPath:
+    """Tests for analyze_pmcc Tradier integration (tradier_* params)."""
+
+    @patch("trading_skills.scanner_pmcc.get_earnings_info", return_value=_NO_EARNINGS)
+    def test_tradier_path_produces_valid_result(self, _mock_earnings):
+        """When all Tradier params are provided, analyze_pmcc returns a scored result.
+
+        Price is set to 88 so ATM window (83.6–92.4) covers the LEAPS strikes,
+        giving _compute_atm_iv_median real data to work with.
+        """
+        leaps_chain = _make_tradier_chain(
+            strikes=[75.0, 80.0, 85.0],  # ITM at price=88; 80 and 85 in ATM window
+            ivs=[0.32, 0.30, 0.28],
+            ois=[500, 800, 300],
+            bids=[15.0, 11.0, 7.0],
+            asks=[16.0, 12.0, 8.0],
+        )
+        short_chain = _make_tradier_chain(
+            strikes=[90.0, 93.0, 96.0],
+            ivs=[0.33, 0.31, 0.29],
+            ois=[2000, 1500, 800],
+            bids=[1.80, 1.20, 0.70],
+            asks=[2.00, 1.40, 0.90],
+        )
+        result = analyze_pmcc(
+            "TEST",
+            tradier_leaps_chain=leaps_chain,
+            tradier_leaps_expiry="2027-01-15",
+            tradier_short_chain=short_chain,
+            tradier_short_expiry="2026-04-25",
+            tradier_price=88.0,
+        )
+        assert result is not None
+        assert "pmcc_score" in result
+        assert result["price"] == 88.0
+        assert result["leaps"]["expiry"] == "2027-01-15"
+        assert result["short"]["expiry"] == "2026-04-25"
+
+    @patch("trading_skills.scanner_pmcc.get_earnings_info", return_value=_NO_EARNINGS)
+    def test_tradier_path_uses_tradier_iv(self, _mock_earnings):
+        """IV in result reflects Tradier greeks.mid_iv (decimal), not yfinance NaN.
+
+        Price=88 → ATM window 83.6–92.4 → strike 85 (iv=0.35) and 90 (iv=0.33) both in window.
+        Median = 0.34 → leaps_iv_pct ≈ 34.0.
+        """
+        leaps_chain = _make_tradier_chain(
+            strikes=[80.0, 85.0, 90.0],
+            ivs=[0.36, 0.35, 0.33],
+            ois=[500, 600, 300],
+            bids=[11.0, 7.0, 4.0],
+            asks=[12.0, 8.0, 5.0],
+        )
+        short_chain = _make_tradier_chain(
+            strikes=[91.0, 94.0],
+            ivs=[0.36, 0.34],
+            ois=[2000, 1000],
+            bids=[1.80, 1.20],
+            asks=[2.00, 1.40],
+        )
+        result = analyze_pmcc(
+            "TEST",
+            tradier_leaps_chain=leaps_chain,
+            tradier_leaps_expiry="2027-01-15",
+            tradier_short_chain=short_chain,
+            tradier_short_expiry="2026-04-25",
+            tradier_price=88.0,
+        )
+        assert result is not None
+        if "pmcc_score" in result:
+            # ATM window 83.6–92.4 → strikes 85 (0.35) and 90 (0.33) → median = 0.34 = 34%
+            assert abs(result["leaps_iv_pct"] - 34.0) < 2.0
+
+    def test_tradier_leaps_too_near_returns_error(self):
+        """LEAPS expiry < min_leaps_days returns error dict, not None."""
+        leaps_chain = _make_tradier_chain([85.0], [0.30], [500], [18.0], [19.0])
+        short_chain = _make_tradier_chain([102.0], [0.31], [2000], [1.80], [2.00])
+        result = analyze_pmcc(
+            "TEST",
+            tradier_leaps_chain=leaps_chain,
+            tradier_leaps_expiry="2026-05-15",  # ~44 days — too near for LEAPS
+            tradier_short_chain=short_chain,
+            tradier_short_expiry="2026-04-25",
+            tradier_price=100.0,
+        )
+        assert result is not None
+        assert "error" in result
+        assert "LEAPS" in result["error"]
+
+    def test_tradier_mcp_wrapper_format_parsed(self):
+        """Tradier chain passed as MCP wrapper [{"type": "text", "text": "..."}] is handled."""
+        import json as _json
+        leaps_chain_dict = _make_tradier_chain([85.0], [0.30], [500], [18.0], [19.0])
+        leaps_chain_wrapped = [{"type": "text", "text": _json.dumps(leaps_chain_dict)}]
+        short_chain = _make_tradier_chain([102.0], [0.31], [2000], [1.80], [2.00])
+
+        df = _tradier_calls_to_df(leaps_chain_wrapped)
+        assert not df.empty
+        assert df.iloc[0]["strike"] == 85.0
+        assert df.iloc[0]["impliedVolatility"] == pytest.approx(0.30)
+
+    def test_tradier_calls_to_df_filters_puts(self):
+        """_tradier_calls_to_df returns only calls, not puts."""
+        mixed_chain = _make_tradier_chain([85.0], [0.30], [500], [18.0], [19.0])
+        # Add a put row
+        mixed_chain["options"]["option"].append({
+            "option_type": "put",
+            "strike": 85.0,
+            "bid": 2.0,
+            "ask": 2.5,
+            "open_interest": 200,
+            "volume": 5,
+            "greeks": {"mid_iv": 0.31},
+        })
+        df = _tradier_calls_to_df(mixed_chain)
+        assert len(df) == 1  # only the call
+        assert df.iloc[0]["strike"] == 85.0
